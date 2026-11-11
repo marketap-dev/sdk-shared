@@ -96,7 +96,8 @@ jobs:
           git show "$(jq -r .merge_commit_sha /tmp/pr.json)^1:scripts/release/version.sh" > /tmp/version.sh
           VERSION=$(bash /tmp/version.sh get)
           FILES=$(gh api --paginate "$API/files" --jq '.[].filename')
-          CI=$(gh pr checks "$NUM" --json workflow,bucket --jq '[.[] | select(.workflow != env.GITHUB_WORKFLOW) | .bucket] | if length == 0 then "pending" elif any(. == "fail" or . == "cancel") then "fail" elif any(. == "pending") then "pending" else "pass" end') || CI=pending
+          CI=$(gh pr checks "$NUM" --json workflow,bucket --jq '[.[] | select(.workflow != env.GITHUB_WORKFLOW) | .bucket] | if length == 0 then "pending" elif any(. == "fail" or . == "cancel") then "fail" elif any(. == "pending") then "pending" else "pass" end' 2>/dev/null) || true
+          [ -n "$CI" ] || CI=pending
           ERR=()
           [ "$(jq -r .user.login /tmp/pr.json)" = "$BOT" ] || ERR+=("작성자가 $BOT 이 아닙니다")
           [ "$(jq -r .head.ref /tmp/pr.json)" = "release/$VERSION" ] || ERR+=("브랜치와 파일 버전 $VERSION 이 다릅니다")
