@@ -1,0 +1,64 @@
+name: Rollback CDN
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        type: string
+        required: true
+      files:
+        type: string
+        required: true
+      version-prefix:
+        type: string
+        required: true
+      latest-prefix:
+        type: string
+        required: true
+      bucket:
+        type: string
+        required: true
+      distribution-id:
+        type: string
+        required: true
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: prod
+    steps:
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-northeast-2
+
+      - env:
+          VERSION: ${{ inputs.version }}
+          FILES: ${{ inputs.files }}
+          BUCKET: ${{ inputs.bucket }}
+          VPREFIX: ${{ inputs.version-prefix }}
+          LPREFIX: ${{ inputs.latest-prefix }}
+          DISTRIBUTION_ID: ${{ inputs.distribution-id }}
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::정식 버전(예 1.6.0)만 됩니다"; exit 1; }
+          PATHS=()
+          for f in $FILES; do
+            aws s3api head-object --bucket "$BUCKET" --key "$VPREFIX/$f" >/dev/null || { echo "::error::$VPREFIX/$f 가 없습니다"; exit 1; }
+          done
+          for f in $FILES; do
+            aws s3 cp "s3://$BUCKET/$VPREFIX/$f" "s3://$BUCKET/$LPREFIX/$f" --content-type application/javascript --metadata-directive REPLACE
+            PATHS+=("/$LPREFIX/$f")
+          done
+          ID=$(aws cloudfront create-invalidation --distribution-id "$DISTRIBUTION_ID" --paths "${PATHS[@]}" --query Invalidation.Id --output text)
+          aws cloudfront wait invalidation-completed --distribution-id "$DISTRIBUTION_ID" --id "$ID"

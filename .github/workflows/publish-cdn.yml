@@ -1,0 +1,143 @@
+name: Publish CDN
+
+on:
+  workflow_call:
+    inputs:
+      sha:
+        type: string
+        required: true
+      files:
+        type: string
+        required: true
+      version-prefix:
+        type: string
+        required: true
+      latest-prefix:
+        type: string
+        required: true
+      bucket:
+        type: string
+        required: true
+      public-base-url:
+        type: string
+        required: true
+      distribution-id:
+        type: string
+        required: true
+      build-command:
+        type: string
+        default: npm run build
+      smoke-global:
+        type: string
+      promote-latest:
+        type: boolean
+        default: true
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  FILES: ${{ inputs.files }}
+  BUCKET: ${{ inputs.bucket }}
+  VPREFIX: ${{ inputs.version-prefix }}
+  BASE_URL: ${{ inputs.public-base-url }}/${{ inputs.version-prefix }}
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: prod
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: 22.12.0
+          cache: npm
+
+      - run: npm ci && bash -c "$BUILD"
+        env:
+          BUILD: ${{ inputs.build-command }}
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-northeast-2
+
+      - run: |
+          set -euo pipefail
+          for f in $FILES; do
+            if ETAG=$(aws s3api head-object --bucket "$BUCKET" --key "$VPREFIX/$f" --query ETag --output text 2>/dev/null); then
+              [ "${ETAG//\"/}" = "$(md5sum < "dist/$f" | cut -d' ' -f1)" ] || { echo "::error::$VPREFIX/$f 에 다른 내용이 이미 있습니다. 다음 버전으로 내세요"; exit 1; }
+            else
+              aws s3 cp "dist/$f" "s3://$BUCKET/$VPREFIX/$f" --content-type application/javascript --cache-control "public, max-age=31536000, immutable"
+            fi
+            curl -fsS "$BASE_URL/$f" | cmp -s - "dist/$f" || { echo "::error::$BASE_URL/$f 내용이 빌드 결과와 다릅니다"; exit 1; }
+          done
+
+  smoke:
+    needs: upload
+    if: inputs.smoke-global
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - env:
+          GLOBAL: ${{ inputs.smoke-global }}
+        run: |
+          set -euo pipefail
+          npm i --no-save --no-audit --no-fund playwright@1.65.0
+          npx playwright install --with-deps chromium
+          cat > smoke.mjs <<'JS'
+          import { chromium } from 'playwright';
+          const { BASE_URL, FILES, GLOBAL } = process.env;
+          const browser = await chromium.launch();
+          const page = await browser.newPage();
+          const errors = [];
+          page.on('pageerror', e => errors.push(String(e)));
+          await page.route('**/*', r => r.request().url().startsWith(BASE_URL) ? r.continue() : r.abort());
+          await page.setContent('<!doctype html><html><body></body></html>');
+          for (const f of FILES.split(/\s+/).filter(Boolean)) await page.addScriptTag({ url: `${BASE_URL}/${f}` });
+          await page.waitForTimeout(1000);
+          const type = await page.evaluate(g => typeof window[g], GLOBAL);
+          await browser.close();
+          if (errors.length || type === 'undefined') {
+            console.log(`::error::window.${GLOBAL}=${type} ${errors.join(' | ')}`);
+            process.exit(1);
+          }
+          JS
+          node smoke.mjs
+
+  promote:
+    needs: [upload, smoke]
+    if: ${{ !cancelled() && inputs.promote-latest && needs.upload.result == 'success' && needs.smoke.result != 'failure' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: prod
+    steps:
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-northeast-2
+
+      - env:
+          LPREFIX: ${{ inputs.latest-prefix }}
+          DISTRIBUTION_ID: ${{ inputs.distribution-id }}
+        run: |
+          set -euo pipefail
+          PATHS=()
+          for f in $FILES; do
+            aws s3 cp "s3://$BUCKET/$VPREFIX/$f" "s3://$BUCKET/$LPREFIX/$f" --content-type application/javascript --metadata-directive REPLACE
+            PATHS+=("/$LPREFIX/$f")
+          done
+          ID=$(aws cloudfront create-invalidation --distribution-id "$DISTRIBUTION_ID" --paths "${PATHS[@]}" --query Invalidation.Id --output text)
+          aws cloudfront wait invalidation-completed --distribution-id "$DISTRIBUTION_ID" --id "$ID"

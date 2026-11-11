@@ -1,0 +1,80 @@
+name: Publish npm
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        type: string
+        required: true
+      sha:
+        type: string
+        required: true
+      latest:
+        type: string
+        default: 'true'
+
+permissions:
+  contents: read
+
+jobs:
+  pack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      exists: ${{ steps.meta.outputs.exists }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: '18'
+          cache: npm
+
+      - id: meta
+        env:
+          VERSION: ${{ inputs.version }}
+        run: echo "exists=$(npm view "$(node -p 'require("./package.json").name')@$VERSION" version >/dev/null 2>&1 && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - if: steps.meta.outputs.exists == 'false'
+        run: npm ci && npm pack --ignore-scripts
+
+      - if: steps.meta.outputs.exists == 'false'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: npm-tarball
+          path: '*.tgz'
+          if-no-files-found: error
+
+  publish:
+    needs: pack
+    if: needs.pack.outputs.exists == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: publish-npm-${{ github.repository }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: npm-tarball
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: '22'
+          registry-url: https://registry.npmjs.org
+
+      - env:
+          VERSION: ${{ inputs.version }}
+          LATEST: ${{ inputs.latest }}
+        run: |
+          set -euo pipefail
+          npm i -g npm@11.21.2
+          TAG=latest
+          [ "$LATEST" = true ] || TAG=previous
+          [[ "$VERSION" != *-* ]] || { [[ "$VERSION" =~ -([a-z]+) ]] && TAG=${BASH_REMATCH[1]} || TAG=next; }
+          npm publish ./*.tgz --tag "$TAG" --access public

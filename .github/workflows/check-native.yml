@@ -1,0 +1,39 @@
+name: Check native SDK
+
+on:
+  workflow_call:
+    inputs:
+      sha:
+        type: string
+        required: true
+      gradle-file:
+        type: string
+        required: true
+      podspec-file:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+
+      - env:
+          GRADLE: ${{ inputs.gradle-file }}
+          PODSPEC: ${{ inputs.podspec-file }}
+        run: |
+          set -euo pipefail
+          ANDROID=$(sed -nE "s/.*marketap-android-sdk:([^'\"]+).*/\1/p" "$GRADLE")
+          IOS=$(sed -nE "s/.*MarketapSDK['\"], *['\"]([^'\"]+).*/\1/p" "$PODSPEC")
+          [ "$(curl -fsS "https://jitpack.io/api/builds/com.github.marketap-dev/marketap-android-sdk/$ANDROID" | jq -r .status)" = ok ] ||
+            { echo "::error::Android $ANDROID 이 JitPack 에 없습니다. Android 를 먼저 릴리즈하세요"; exit 1; }
+          curl -fsS -o /dev/null "https://trunk.cocoapods.org/api/v1/pods/MarketapSDK/versions/$IOS" ||
+            { echo "::error::iOS $IOS 이 CocoaPods 에 없습니다. iOS 를 먼저 릴리즈하세요"; exit 1; }

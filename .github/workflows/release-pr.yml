@@ -1,0 +1,104 @@
+name: Release PR
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        type: string
+        required: true
+      ref:
+        type: string
+        default: main
+      summary:
+        type: string
+      tag-prefix:
+        type: string
+    secrets:
+      SDK_RELEASE_APP_ID:
+        required: true
+      SDK_RELEASE_APP_PRIVATE_KEY:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  release-pr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      VERSION: ${{ inputs.version }}
+      REF: ${{ inputs.ref }}
+      SUMMARY: ${{ inputs.summary }}
+      PREFIX: ${{ inputs.tag-prefix }}
+      BRANCH: release/${{ inputs.version }}
+      SCRIPT: scripts/release/version.sh
+    steps:
+      - id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510
+        with:
+          app-id: ${{ secrets.SDK_RELEASE_APP_ID }}
+          private-key: ${{ secrets.SDK_RELEASE_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          SLUG: ${{ steps.app.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          semver() { env -u GH_TOKEN npx -y semver@7.8.6 -p "$@"; }
+          SHA=$(git rev-parse -q --verify "origin/$REF^{commit}" || git rev-parse -q --verify "$REF^{commit}") || fail "기준 커밋을 찾을 수 없습니다: $REF"
+          git merge-base --is-ancestor "$SHA" origin/main || fail "$REF 는 main 에 머지된 커밋이 아닙니다"
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || fail "버전 형식이 아닙니다(예 1.6.0, 1.6.0-beta.1): $VERSION"
+          [ -z "$(git tag -l "$PREFIX$VERSION")" ] || fail "$PREFIX$VERSION 은 이미 낸 버전입니다"
+          semver -r ">$(bash "$SCRIPT" get)" "$VERSION" >/dev/null || fail "$VERSION 이 main 의 현재 버전보다 크지 않습니다"
+          PREV=$(git tag -l "$PREFIX*" | sed "s/^$PREFIX//" | env -u GH_TOKEN xargs -r npx -y semver@7.8.6 -r "<$VERSION" | tail -1 || true)
+
+          git switch -q -c "$BRANCH" "$SHA"
+          bash "$SCRIPT" set "$VERSION"
+          bash "$SCRIPT" check
+
+          gh pr list --label release --state open --json number,headRefName --jq '.[] | "\(.number) \(.headRefName)"' |
+          while read -r NUM HEAD; do
+            [ "$HEAD" = "$BRANCH" ] || fail "다른 버전의 release PR(#$NUM)이 열려 있습니다. 머지하거나 닫은 뒤 다시 실행하세요"
+            gh pr close "$NUM" --comment "같은 버전으로 다시 만듭니다"
+          done
+
+          gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" -f "tag_name=$PREFIX$VERSION" -f "target_commitish=$SHA" ${PREV:+-f "previous_tag_name=$PREFIX$PREV"} --jq .body > /tmp/notes.md
+          {
+            printf '# Changelog\n\n## %s (%s)\n\n' "$VERSION" "$(TZ=Asia/Seoul date +%F)"
+            [ -z "$SUMMARY" ] || printf '%s\n\n' "$SUMMARY"
+            cat /tmp/notes.md
+            echo
+            sed '/^# Changelog$/d' CHANGELOG.md 2>/dev/null || true
+          } > /tmp/CHANGELOG.md
+          mv /tmp/CHANGELOG.md CHANGELOG.md
+
+          git config user.name "${SLUG}[bot]"
+          git config user.email "$(gh api "users/$SLUG%5Bbot%5D" --jq .id)+${SLUG}[bot]@users.noreply.github.com"
+          git add -A
+          git commit -qm "release: $VERSION"
+          git push -qf "https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY.git" "$BRANCH"
+
+          cat > /tmp/body.md <<EOF
+          ## 요약
+
+          ${SUMMARY:-<!-- 머지 전에 요약을 적어 주세요. GitHub Release 노트 맨 위에 들어갑니다. -->}
+
+          ## 변경 내역
+
+          $(cat /tmp/notes.md)
+
+          <!-- release-footer -->
+          ---
+          - 기준 커밋: \`$SHA\`
+          - 버전 파일과 CHANGELOG.md 만 바꿉니다. CI 가 통과하면 머지하세요. 머지하면 배포됩니다.
+          EOF
+          gh label create release --color 0E8A16 --force >/dev/null
+          gh pr create --base main --head "$BRANCH" --title "release: $VERSION" --label release --body-file /tmp/body.md

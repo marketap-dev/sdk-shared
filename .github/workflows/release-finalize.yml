@@ -1,0 +1,62 @@
+name: Release finalize
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+      sha:
+        type: string
+        required: true
+      pr:
+        type: string
+        required: true
+      prerelease:
+        type: string
+        default: 'false'
+      latest:
+        type: string
+        default: 'true'
+    secrets:
+      SDK_RELEASE_APP_ID:
+        required: true
+      SDK_RELEASE_APP_PRIVATE_KEY:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510
+        with:
+          app-id: ${{ secrets.SDK_RELEASE_APP_ID }}
+          private-key: ${{ secrets.SDK_RELEASE_APP_PRIVATE_KEY }}
+
+      - env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+          SHA: ${{ inputs.sha }}
+          PR: ${{ inputs.pr }}
+          PRERELEASE: ${{ inputs.prerelease }}
+          LATEST: ${{ inputs.latest }}
+        run: |
+          set -euo pipefail
+          API="repos/$GH_REPO"
+          gh api "$API/pulls/$PR" > /tmp/pr.json
+          if gh api "$API/commits/$TAG" --jq .sha > /tmp/tag-sha 2>/dev/null; then
+            [ "$(cat /tmp/tag-sha)" = "$SHA" ] || { echo "::error::tag $TAG 가 이미 다른 커밋을 가리킵니다"; exit 1; }
+          else
+            gh api "$API/git/refs" -f "ref=refs/tags/$TAG" -f "sha=$SHA" >/dev/null
+          fi
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            jq -r .body /tmp/pr.json | tr -d '\r' | sed '/^<!-- release-footer -->$/,$d' > /tmp/notes.md
+            gh release create "$TAG" --title "$TAG" --notes-file /tmp/notes.md --verify-tag --prerelease="$PRERELEASE" --latest="$LATEST"
+          fi
+          gh api -X DELETE "$API/git/refs/heads/$(jq -r .head.ref /tmp/pr.json)" 2>/dev/null || true
