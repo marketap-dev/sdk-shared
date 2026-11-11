@@ -6,9 +6,6 @@ on:
       version:
         type: string
         required: true
-      ref:
-        type: string
-        default: main
       summary:
         type: string
       tag-prefix:
@@ -28,7 +25,6 @@ jobs:
     timeout-minutes: 10
     env:
       VERSION: ${{ inputs.version }}
-      REF: ${{ inputs.ref }}
       SUMMARY: ${{ inputs.summary }}
       PREFIX: ${{ inputs.tag-prefix }}
       BRANCH: release/${{ inputs.version }}
@@ -42,7 +38,6 @@ jobs:
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: main
           fetch-depth: 0
           persist-credentials: false
 
@@ -53,8 +48,7 @@ jobs:
           set -euo pipefail
           fail() { echo "::error::$1"; exit 1; }
           semver() { env -u GH_TOKEN npx -y semver@7.8.6 -p "$@"; }
-          SHA=$(git rev-parse -q --verify "origin/$REF^{commit}" || git rev-parse -q --verify "$REF^{commit}") || fail "기준 커밋을 찾을 수 없습니다: $REF"
-          git merge-base --is-ancestor "$SHA" origin/main || fail "$REF 는 main 에 머지된 커밋이 아닙니다"
+          SHA=$(git rev-parse HEAD)
           [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || fail "버전 형식이 아닙니다(예 1.6.0, 1.6.0-beta.1): $VERSION"
           [ -z "$(git tag -l "$PREFIX$VERSION")" ] || fail "$PREFIX$VERSION 은 이미 낸 버전입니다"
           semver -r ">$(bash "$SCRIPT" get)" "$VERSION" >/dev/null || fail "$VERSION 이 main 의 현재 버전보다 크지 않습니다"
