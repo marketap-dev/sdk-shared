@@ -90,9 +90,7 @@ jobs:
           $(cat /tmp/notes.md)
 
           <!-- release-footer -->
-          ---
-          - 기준 커밋: \`$SHA\`
-          - 버전 파일과 CHANGELOG.md 만 바꿉니다. CI 가 통과하면 머지하세요. 머지하면 배포됩니다.
+          기준 커밋: \`$SHA\`
           EOF
           gh label create release --color 0E8A16 --force >/dev/null
           gh pr create --base main --head "$BRANCH" --title "release: $VERSION" --label release --body-file /tmp/body.md
