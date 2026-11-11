@@ -1,0 +1,124 @@
+name: Release gate
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        type: string
+      tag-prefix:
+        type: string
+    secrets:
+      SDK_RELEASE_APP_ID:
+        required: true
+      SDK_RELEASE_APP_PRIVATE_KEY:
+        required: true
+    outputs:
+      proceed:
+        value: ${{ jobs.gate.outputs.proceed }}
+      version:
+        value: ${{ jobs.gate.outputs.version }}
+      tag:
+        value: ${{ jobs.gate.outputs.tag }}
+      sha:
+        value: ${{ jobs.gate.outputs.sha }}
+      pr:
+        value: ${{ jobs.gate.outputs.pr }}
+      prerelease:
+        value: ${{ jobs.gate.outputs.prerelease }}
+      latest:
+        value: ${{ jobs.gate.outputs.latest }}
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed || 'false' }}
+      version: ${{ steps.check.outputs.version }}
+      tag: ${{ steps.check.outputs.tag }}
+      sha: ${{ steps.check.outputs.sha }}
+      pr: ${{ steps.find.outputs.number }}
+      prerelease: ${{ steps.check.outputs.prerelease }}
+      latest: ${{ steps.check.outputs.latest }}
+    steps:
+      - id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510
+        with:
+          app-id: ${{ secrets.SDK_RELEASE_APP_ID }}
+          private-key: ${{ secrets.SDK_RELEASE_APP_PRIVATE_KEY }}
+
+      - id: find
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          MERGED: ${{ github.event.pull_request.merged }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = workflow_dispatch ]; then
+            NUM=$(gh pr list --state merged --head "release/$INPUT_VERSION" --label release --json number --jq '.[0].number // empty')
+            [ -n "$NUM" ] || { echo "::error::머지된 release/$INPUT_VERSION PR 이 없습니다"; exit 1; }
+          elif [ "$MERGED" = true ]; then
+            NUM=$PR_NUMBER
+          else
+            REF="repos/$GITHUB_REPOSITORY/git/refs/heads/$HEAD_REF"
+            [ "$(gh api "$REF" --jq .object.sha 2>/dev/null)" != "$HEAD_SHA" ] || gh api -X DELETE "$REF"
+            exit 0
+          fi
+          echo "number=$NUM" >> "$GITHUB_OUTPUT"
+
+      - if: steps.find.outputs.number
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: refs/pull/${{ steps.find.outputs.number }}/head
+          fetch-depth: 0
+          persist-credentials: false
+
+      - id: check
+        if: steps.find.outputs.number
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          NUM: ${{ steps.find.outputs.number }}
+          BOT: ${{ steps.app.outputs.app-slug }}[bot]
+          PREFIX: ${{ inputs.tag-prefix }}
+        run: |
+          set -euo pipefail
+          API="repos/$GITHUB_REPOSITORY/pulls/$NUM"
+          gh api "$API" > /tmp/pr.json
+          git show "$(jq -r .merge_commit_sha /tmp/pr.json)^1:scripts/release/version.sh" > /tmp/version.sh
+          VERSION=$(bash /tmp/version.sh get)
+          FILES=$(gh api --paginate "$API/files" --jq '.[].filename')
+          CI=$(gh pr checks "$NUM" --json workflow,bucket --jq '[.[] | select(.workflow != env.GITHUB_WORKFLOW) | .bucket] | if length == 0 then "pending" elif any(. == "fail" or . == "cancel") then "fail" elif any(. == "pending") then "pending" else "pass" end') || CI=pending
+          ERR=()
+          [ "$(jq -r .user.login /tmp/pr.json)" = "$BOT" ] || ERR+=("작성자가 $BOT 이 아닙니다")
+          [ "$(jq -r .head.ref /tmp/pr.json)" = "release/$VERSION" ] || ERR+=("브랜치와 파일 버전 $VERSION 이 다릅니다")
+          grep -vxF "$(bash /tmp/version.sh files; echo CHANGELOG.md)" <<< "$FILES" >/dev/null && ERR+=("버전 파일과 CHANGELOG.md 외의 변경이 있습니다")
+          bash /tmp/version.sh check || ERR+=("버전 파일끼리 값이 다릅니다")
+          [ "$CI" != fail ] || ERR+=("PR CI 가 실패했습니다")
+          if ((${#ERR[@]})); then
+            gh pr comment "$NUM" --body "$(printf '배포하지 않았습니다.\n\n'; printf -- '- %s\n' "${ERR[@]}"; printf '\n원인을 고친 뒤 다음 patch 버전으로 Create release PR 을 실행하세요.')"
+            printf '::error::%s\n' "${ERR[@]}"
+            exit 1
+          fi
+          if [ "$CI" = pending ]; then
+            gh pr comment "$NUM" --body "PR CI 결과를 확인하지 못해 배포하지 않았습니다(진행 중이거나 아직 등록 전). CI 가 끝나면 Publish release 를 version=$VERSION 으로 실행하세요."
+            echo "::error::PR CI 결과를 확인하지 못했습니다"
+            exit 1
+          fi
+          HIGHEST=$(git tag -l "$PREFIX*" | sed "s/^$PREFIX//" | env -u GH_TOKEN xargs -r npx -y semver@7.8.6 -r '*' | tail -1 || true)
+          {
+            echo "proceed=true"
+            echo "version=$VERSION"
+            echo "tag=$PREFIX$VERSION"
+            echo "sha=$(git rev-parse HEAD)"
+            echo "prerelease=$([[ "$VERSION" == *-* ]] && echo true || echo false)"
+            echo "latest=$([[ "$VERSION" != *-* ]] && env -u GH_TOKEN npx -y semver@7.8.6 -r ">=${HIGHEST:-0.0.0}" "$VERSION" >/dev/null && echo true || echo false)"
+          } >> "$GITHUB_OUTPUT"
