@@ -57,6 +57,6 @@ jobs:
           fi
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             jq -r .body /tmp/pr.json | tr -d '\r' | sed '/^<!-- release-footer -->$/,$d' > /tmp/notes.md
-            gh release create "$TAG" --title "$TAG" --notes-file /tmp/notes.md --verify-tag --prerelease="$PRERELEASE" --latest="$LATEST"
+            gh release create "$TAG" --title "$TAG" --notes-file /tmp/notes.md --target "$SHA" --prerelease="$PRERELEASE" --latest="$LATEST"
           fi
           gh api -X DELETE "$API/git/refs/heads/$(jq -r .head.ref /tmp/pr.json)" 2>/dev/null || true
