@@ -95,11 +95,10 @@ jobs:
         run: |
           set -euo pipefail
           npm i --no-save --no-audit --no-fund playwright@1.65.0
-          npx playwright install --with-deps chromium
           cat > smoke.mjs <<'JS'
           import { chromium } from 'playwright';
           const { BASE_URL, FILES, GLOBAL } = process.env;
-          const browser = await chromium.launch();
+          const browser = await chromium.launch({ channel: 'chrome' });
           const page = await browser.newPage();
           const errors = [];
           page.on('pageerror', e => errors.push(String(e)));
@@ -118,7 +117,7 @@ jobs:
 
   promote:
     needs: [upload, smoke]
-    if: ${{ !cancelled() && inputs.promote-latest && needs.upload.result == 'success' && needs.smoke.result != 'failure' }}
+    if: ${{ !cancelled() && inputs.promote-latest && needs.upload.result == 'success' && (needs.smoke.result == 'success' || needs.smoke.result == 'skipped') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment: prod
